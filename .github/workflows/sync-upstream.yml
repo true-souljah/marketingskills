@@ -1,0 +1,158 @@
+name: Sync upstream
+
+# Weekly one-click sync of this fork with its upstream repo. Two branches:
+#
+# - Mirror branch: the upstream repo's default branch. Inside the fork it is a
+#   pure copy of upstream; nobody commits to it.
+# - Work branch: this fork's default branch. All of our own edits live here.
+#
+# Each run fast-forwards the mirror branch to upstream, disables the upstream
+# workflows that came along with the fork (only this one should run here), and
+# opens or reuses a pull request from the mirror branch into the work branch,
+# so picking up upstream is just a Merge click. This file is copied unchanged
+# across several forks, so it names no owner, repo, or branch; every value is
+# looked up at run time through the GitHub API. It lives on the work branch
+# because scheduled workflows only run from the default branch.
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Resolve branches
+        id: resolve
+        run: |
+          set -euo pipefail
+          # github.event has no repository object on schedule events, so look
+          # every value up through the API instead.
+          meta="$(gh api "repos/$REPO" --jq '[.fork, .default_branch, .parent.full_name // ""] | @tsv')"
+          IS_FORK="$(cut -f1 <<<"$meta")"
+          WORK="$(cut -f2 <<<"$meta")"
+          UPSTREAM="$(cut -f3 <<<"$meta")"
+          if [ "$IS_FORK" != "true" ]; then
+            echo "::notice::$REPO is not a fork; this workflow only runs in forks, nothing to sync."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$WORK" ] || [ -z "$UPSTREAM" ]; then
+            echo "::error::Could not resolve the fork's branches: work='$WORK' upstream='$UPSTREAM'."
+            exit 1
+          fi
+          MIRROR="$(gh api "repos/$UPSTREAM" --jq .default_branch)"
+          if [ -z "$MIRROR" ]; then
+            echo "::error::Could not resolve the upstream default branch of $UPSTREAM."
+            exit 1
+          fi
+          if [ "$MIRROR" = "$WORK" ]; then
+            echo "::error::Mirror branch '$MIRROR' is the fork's default branch '$WORK'. Edits must live on the work branch, not on the mirror branch."
+            exit 1
+          fi
+          {
+            echo "WORK=$WORK"
+            echo "UPSTREAM=$UPSTREAM"
+            echo "MIRROR=$MIRROR"
+          } >> "$GITHUB_ENV"
+          echo "work branch (fork default): $WORK"
+          echo "upstream repo: $UPSTREAM"
+          echo "mirror branch (upstream default): $MIRROR"
+
+      - name: Update mirror branch from upstream
+        if: steps.resolve.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          message="$(gh api -X POST "repos/$REPO/merge-upstream" -f branch="$MIRROR" --jq .message 2>&1)" || {
+            echo "$message"
+            echo "::error::Could not update the mirror branch '$MIRROR' from upstream."
+            {
+              echo "## Mirror branch update failed"
+              echo ""
+              echo "Open https://github.com/$REPO/tree/$MIRROR and click **Sync fork**."
+              echo ""
+              echo "- If GitHub says the branch has diverged, someone committed to '$MIRROR'. That branch must stay identical to $UPSTREAM."
+              echo "- Upstream changes to workflow files can also make this API call fail for the Actions token; the **Sync fork** button handles that case."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+          echo "Mirror branch '$MIRROR': $message"
+
+      - name: Disable copied upstream workflows
+        if: steps.resolve.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          # Upstream's own workflows came along with the fork; some write to
+          # the mirror branch or cut releases. Paths outside
+          # .github/workflows/ are GitHub's dynamic workflows: leave them.
+          gh api "repos/$REPO/actions/workflows" --paginate --jq '.workflows[] | select(.state == "active") | [.id, .path] | @tsv' |
+            while IFS=$'\t' read -r wf_id wf_path; do
+              case "$wf_path" in
+                .github/workflows/sync-upstream.yml)
+                  continue
+                  ;;
+                .github/workflows/*)
+                  gh api -X PUT "repos/$REPO/actions/workflows/$wf_id/disable"
+                  echo "Disabled $wf_path"
+                  ;;
+              esac
+            done
+
+      - name: Open or reuse the sync pull request
+        if: steps.resolve.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          AHEAD="$(gh api "repos/$REPO/compare/$WORK...$MIRROR" --jq .ahead_by)"
+          if [ "$AHEAD" -eq 0 ]; then
+            echo "'$WORK' already has every upstream commit." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          existing_url="$(gh pr list -R "$REPO" --base "$WORK" --head "$MIRROR" --state open --json url --jq '.[0].url // empty')"
+          if [ -n "$existing_url" ]; then
+            echo "Sync pull request already open: $existing_url (it updates itself as the mirror branch moves)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          compare_url="https://github.com/$REPO/compare/$WORK...$MIRROR"
+          all_dirs="$(gh api "repos/$REPO/compare/$WORK...$MIRROR" --jq '.files[].filename' |
+            while IFS= read -r file; do dirname "$file"; done | sort -u)"
+          top_dirs="$(head -n 50 <<<"$all_dirs")"
+          bullets=""
+          if [ -n "$top_dirs" ]; then
+            bullets="$(sed 's|^|- |' <<<"$top_dirs")"
+          fi
+          BODY="Upstream has $AHEAD new commits waiting on '$MIRROR'.
+          Compare: $compare_url
+
+          Changed directories (first 50 at most; the list can be partial because GitHub's compare API returns at most 300 files):
+
+          $bullets
+          Merge with **Create a merge commit**. Squash or rebase would make the next sync conflict.
+
+          If GitHub shows a conflict, upstream changed lines that you also edited on '$WORK': ask a Claude session to resolve it on this pull request.
+
+          After merging, ask a Claude session to update the installed skills from this fork."
+          pr_url="$(gh pr create -R "$REPO" --base "$WORK" --head "$MIRROR" --title "Sync upstream $UPSTREAM ($(date -u +%F))" --body "$BODY" 2>&1)" || {
+            echo "$pr_url"
+            echo "::error::Could not create the sync pull request. Enable Settings → Actions → General → Workflow permissions → \"Allow GitHub Actions to create and approve pull requests\", then run this workflow again."
+            exit 1
+          }
+          echo "Sync pull request: $pr_url" >> "$GITHUB_STEP_SUMMARY"
