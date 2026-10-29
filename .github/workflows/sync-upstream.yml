@@ -82,8 +82,23 @@ jobs:
         if: steps.resolve.outputs.skip != 'true'
         run: |
           set -euo pipefail
-          message="$(gh api -X POST "repos/$REPO/merge-upstream" -f branch="$MIRROR" --jq .message 2>&1)" || {
-            echo "$message"
+          # merge-upstream only fails on a conflict: a diverged mirror branch
+          # would get a merge commit, so refuse extra commits first.
+          FORK_OWNER="${REPO%%/*}"
+          extra="$(gh api "repos/$UPSTREAM/compare/$MIRROR...$FORK_OWNER:$MIRROR" --jq .ahead_by)"
+          if [ "$extra" != "0" ]; then
+            echo "::error::The fork's '$MIRROR' has $extra commit(s) that $UPSTREAM does not have."
+            {
+              echo "## Mirror branch has extra commits"
+              echo ""
+              echo "The fork's '$MIRROR' has $extra commit(s) that $UPSTREAM does not have. That branch must stay an exact copy of upstream."
+              echo ""
+              echo "Open https://github.com/$REPO/tree/$MIRROR, move any commits worth keeping to '$WORK' first, then use **Sync fork** → **Discard commits** so '$MIRROR' matches upstream again."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          result="$(gh api -X POST "repos/$REPO/merge-upstream" -f branch="$MIRROR" --jq '[.merge_type, .message] | @tsv' 2>&1)" || {
+            echo "$result"
             echo "::error::Could not update the mirror branch '$MIRROR' from upstream."
             {
               echo "## Mirror branch update failed"
@@ -95,15 +110,34 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           }
+          merge_type="$(cut -f1 <<<"$result")"
+          message="$(cut -f2 <<<"$result")"
+          case "$merge_type" in
+            fast-forward|none) ;;
+            *)
+              echo "::error::Updating '$MIRROR' from upstream gave merge_type '$merge_type', expected fast-forward or none: $message"
+              exit 1
+              ;;
+          esac
           echo "Mirror branch '$MIRROR': $message"
 
       - name: Disable copied upstream workflows
         if: steps.resolve.outputs.skip != 'true'
         run: |
           set -euo pipefail
-          # Upstream's own workflows came along with the fork; some write to
-          # the mirror branch or cut releases. Paths outside
+          # Disable only workflows whose file is on the mirror branch (copied from
+          # upstream); ones added on the work branch stay active. Paths outside
           # .github/workflows/ are GitHub's dynamic workflows: leave them.
+          err="$RUNNER_TEMP/mirror-workflows.err"
+          if ! mirror_paths="$(gh api "repos/$REPO/contents/.github/workflows?ref=$MIRROR" --jq '.[].path' 2>"$err")"; then
+            if grep -q 'HTTP 404' "$err"; then
+              mirror_paths=""
+            else
+              cat "$err" >&2
+              echo "::error::Could not list the workflow files on '$MIRROR'."
+              exit 1
+            fi
+          fi
           gh api "repos/$REPO/actions/workflows" --paginate --jq '.workflows[] | select(.state == "active") | [.id, .path] | @tsv' |
             while IFS=$'\t' read -r wf_id wf_path; do
               case "$wf_path" in
@@ -111,8 +145,10 @@ jobs:
                   continue
                   ;;
                 .github/workflows/*)
-                  gh api -X PUT "repos/$REPO/actions/workflows/$wf_id/disable"
-                  echo "Disabled $wf_path"
+                  if grep -Fxq "$wf_path" <<<"$mirror_paths"; then
+                    gh api -X PUT "repos/$REPO/actions/workflows/$wf_id/disable"
+                    echo "Disabled $wf_path"
+                  fi
                   ;;
               esac
             done
@@ -145,6 +181,7 @@ jobs:
           Changed directories (first 50 at most; the list can be partial because GitHub's compare API returns at most 300 files):
 
           $bullets
+
           Merge with **Create a merge commit**. Squash or rebase would make the next sync conflict.
 
           If GitHub shows a conflict, upstream changed lines that you also edited on '$WORK': ask a Claude session to resolve it on this pull request.
